@@ -1,0 +1,435 @@
+--[[
+	SkyPie – Movement (First-Person Locked)
+
+	Goal:
+	- Deliver a small, readable, professional movement system that follows a strict style guide.
+	- Explain *why* each decision was made, so a reviewer understands intent without guessing.
+
+	Movement included:
+	- Walk (baseline), Sprint (hold), Slide (short impulse + friction), Jump (tuned power).
+
+	Camera policy:
+	- Lock the game in first-person to match your request.
+	- Use engine camera (Custom + LockFirstPerson) instead of a custom camera loop.
+	  Reason: Roblox’s built-in camera gives stable head tracking, is latency-aware, and plays
+	  the nicest with Humanoid animations. We only adjust FOV and Humanoid.CameraOffset for
+	  subtle effects — less surface area, fewer desync bugs.
+
+	Notes on style:
+	- Services first, then module-level constants, then locals + functions, per guide.
+	- Clear names (no cryptic hrp/hum unless unavoidable).
+	- Prefer one statement per line; avoid “return on same line” patterns.
+	- Comments favor “why” and trade-offs over “what the line literally does”.
+
+	Networking:
+	- All logic here is client-side, intended for feel. Competitive games usually mirror
+	  movement validation on the server; not included here because you asked for a local
+	  movement module only.
+]]
+
+-- Services (explicit GetService calls help tooling and avoid globals)
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+
+-- Constants (LOUD_SNAKE_CASE as per guide; easy to spot, easy to tweak)
+-- Speeds are conservative to keep control tight in first-person.
+local WALK_SPEED = 16            -- Chosen to match Roblox default; keeps muscle memory intact.
+local SPRINT_SPEED = 26          -- Higher speed when holding LeftShift; still controllable in FPS.
+local SLIDE_PUSH_SPEED = 42      -- Initial burst when starting a slide; not constant velocity.
+local SLIDE_DURATION = 0.55      -- Slides are short by design to avoid “infinite surf” exploits.
+local SLIDE_COOLDOWN = 0.85      -- Prevents spamming; balances feel and fairness.
+local JUMP_POWER = 50            -- Slightly higher than default for responsive FPS jumping.
+local GROUND_RAY_LENGTH = 3.5    -- Enough to catch feet contact even on small steps/ramps.
+
+-- Camera polish flags (purely aesthetic; can be toggled off if you want zero camera effects)
+local ENABLE_FOV_KICK = true     -- Quick FOV bump on sprint/slide to sell speed in FPS.
+local ENABLE_HEAD_BOB = true     -- Small bob via Humanoid.CameraOffset instead of forcing CFrame.
+
+-- FOV values for “speed feel”. First-person can stomach a bit more FOV safely.
+local BASE_FOV = 75              -- A tiny bit wider than default for spatial awareness.
+local SPRINT_FOV = 82            -- Noticeable but not nauseating.
+local SLIDE_FOV = 86             -- Briefly wider for the slide burst.
+
+-- Player singletons (kept outside functions to avoid re-querying)
+local localPlayer = Players.LocalPlayer
+
+-- Character handles (we wrap init so it can be reused on respawn without duplicating code)
+local character -- set in initCharacter
+local humanoid  -- set in initCharacter
+local humanoidRootPart -- set in initCharacter
+
+-- Movement state (booleans/timestamps; simple is better than over-abstracting)
+local isSprinting = false
+local isSliding = false
+local lastSlideEndedAt = 0       -- Wall-clock time of the most recent slide end (cooldown gate).
+
+-- Camera state (we let the engine own camera transform; we only manage FOV and CameraOffset)
+local currentTargetFov = BASE_FOV
+local headBobT = 0               -- Phase for bobbing; advanced by planar speed.
+local headBobAmount = 0          -- Cached bob amplitude we lerp to each frame.
+
+--[[
+	grounded()
+
+	Why:
+	- Depending on Humanoid.FloorMaterial alone is unreliable on some moving parts and meshes.
+	- A downward raycast that excludes the character is a robust, physics-truthy grounded test.
+
+	Trade-off:
+	- Slightly more CPU than checking FloorMaterial, but this runs client-side at one ray per
+	  frame at most, which is negligible for a single local player.
+
+	Returns:
+	- boolean that indicates whether we detected ground under the feet.
+]]
+local function grounded()
+	if not humanoidRootPart then
+		return false
+	end
+
+	local rayParams = RaycastParams.new()
+	rayParams.FilterDescendantsInstances = { character }
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+	local result = workspace:Raycast(
+		humanoidRootPart.Position,
+		Vector3.new(0, -GROUND_RAY_LENGTH, 0),
+		rayParams
+	)
+
+	if result then
+		return true
+	end
+
+	return false
+end
+
+--[[
+	applyFov(target)
+
+	Why:
+	- Changing camera.FieldOfView directly every frame can cause jitter when the engine also
+	  touches camera for first-person head motion. We instead lerp toward a target FOV which
+	  smooths transitions and avoids sudden pops.
+
+	Alternative:
+	- TweenService could animate FOV, but then we must cancel/restart tweens on state changes.
+	  Lerp is cheaper and avoids race conditions.
+]]
+local function applyFov(target)
+	currentTargetFov = target
+end
+
+--[[
+	startSlide()
+
+	Why:
+	- Slides are instantaneous “impulse into friction” rather than constant thrusters.
+	  BodyVelocity for 0.35–0.40s gives a clean kick and naturally tapers with floor friction.
+
+	Guards:
+	- Don’t start if already sliding (idempotency).
+	- Don’t start if not grounded (air slides feel floaty in FPS and create exploits).
+	- Cooldown gate prevents spam; slide is meant as a movement accent, not a replacement.
+
+	Implementation:
+	- BodyVelocity with Y force 0 to avoid vertical weirdness.
+	- Debris cleans the BodyVelocity automatically to avoid stale instances.
+	- Restore WalkSpeed context-sensitively (sprinting resumes sprint speed).
+]]
+local function startSlide()
+	if isSliding then
+		return
+	end
+
+	if not grounded() then
+		return
+	end
+
+	local now = time()
+	if (now - lastSlideEndedAt) < SLIDE_COOLDOWN then
+		return
+	end
+
+	isSliding = true
+
+	-- Give an initial push in look direction. We read the camera’s facing rather than HRP CFrame,
+	-- because in FPS the camera is the ground truth of the player’s intent.
+	local bodyVelocity = Instance.new("BodyVelocity")
+	bodyVelocity.MaxForce = Vector3.new(1e5, 0, 1e5) -- No vertical force to avoid “air-lifts”.
+	bodyVelocity.Velocity = workspace.CurrentCamera.CFrame.LookVector * SLIDE_PUSH_SPEED
+	bodyVelocity.Parent = humanoidRootPart
+	Debris:AddItem(bodyVelocity, 0.40) -- Automatic cleanup; avoids manual :Destroy timing bugs.
+
+	-- While sliding, we want a higher land-speed feel but still finite. Using WalkSpeed here
+	-- mainly influences Humanoid:Move constraints (like air control), not the “push,” which
+	-- is from BodyVelocity. This keeps control snappy without permanent speed changes.
+	humanoid.WalkSpeed = math.max(WALK_SPEED, SPRINT_SPEED - 2)
+
+	if ENABLE_FOV_KICK then
+		applyFov(SLIDE_FOV)
+	end
+
+	task.delay(SLIDE_DURATION, function()
+		isSliding = false
+		lastSlideEndedAt = time()
+
+		-- Revert to appropriate speed for the current sprint state.
+		if isSprinting then
+			humanoid.WalkSpeed = SPRINT_SPEED
+		else
+			humanoid.WalkSpeed = WALK_SPEED
+		end
+
+		if ENABLE_FOV_KICK then
+			applyFov(if isSprinting then SPRINT_FOV else BASE_FOV)
+		end
+	end)
+end
+
+--[[
+	setSprint(on)
+
+	Why:
+	- Sprint is a hold-to-run mechanic; it avoids toggle edge-cases and is familiar for FPS.
+	- Only changes baseline WalkSpeed; does not fight the slide impulse.
+
+	Design detail:
+	- We refuse to modify speed during a slide (slide controls it). Once slide ends we honor
+	  sprint state in the restoration path. This prevents jarring speed flips mid-slide.
+]]
+local function setSprint(on)
+	isSprinting = on
+
+	if isSliding then
+		return
+	end
+
+	if on then
+		humanoid.WalkSpeed = SPRINT_SPEED
+		if ENABLE_FOV_KICK then
+			applyFov(SPRINT_FOV)
+		end
+	else
+		humanoid.WalkSpeed = WALK_SPEED
+		if ENABLE_FOV_KICK then
+			applyFov(BASE_FOV)
+		end
+	end
+end
+
+--[[
+	updateHeadBob(dt)
+
+	Why:
+	- First-person can feel “stuck to the floor” without micro motion. CameraOffset is the least
+	  invasive way to add taste-level bob and avoid fighting the engine camera.
+
+	Shape:
+	- Amplitude scales with planar speed so idle has no bob, sprint has a bit more.
+	- Frequency proportional to speed, but capped to avoid nausea.
+
+	Alt:
+	- Full custom camera CFrame bob was avoided because LockFirstPerson already handles head pose,
+	  and fighting it creates jitter and security issues (it’s also harder to keep stable).
+]]
+local function updateHeadBob(dt)
+	if not ENABLE_HEAD_BOB then
+		humanoid.CameraOffset = Vector3.new(0, 0, 0)
+		return
+	end
+
+	-- Planar speed (ignore vertical so jumps don’t spike bob).
+	local planarVelocity = humanoidRootPart.AssemblyLinearVelocity
+	local planarSpeed = Vector3.new(planarVelocity.X, 0, planarVelocity.Z).Magnitude
+
+	-- Advance phase proportionally to speed.
+	local speedFactor = math.clamp(planarSpeed / 20, 0, 2) -- Soft cap for comfort.
+	headBobT += dt * (6 + 10 * speedFactor)
+
+	-- Target amplitude fades in with speed, remains small overall to prevent motion sickness.
+	local targetAmount = 0.05 * speedFactor
+	headBobAmount = headBobAmount + (targetAmount - headBobAmount) * 0.10
+
+	-- Simple vertical bob; could add lateral sway but vertical reads cleanest in FPS.
+	local offsetY = math.sin(headBobT) * headBobAmount
+
+	humanoid.CameraOffset = Vector3.new(0, offsetY, 0)
+end
+
+--[[
+	updateMove(dt)
+
+	Why:
+	- Even in FPS, calling Humanoid:Move with camera-relative vectors gives more predictable
+	  strafing and air control than relying only on input capture. It also respects physics.
+
+	Alternative:
+	- Using default Roblox controls alone is viable, but combining them with explicit Move()
+	  gives reliable strafing on custom surfaces and during slide aftermath.
+]]
+local function updateMove(dt)
+	-- Build a camera-relative move vector from WASD. We only use horizontal plane.
+	local cameraCFrame = workspace.CurrentCamera.CFrame
+
+	local desired = Vector3.new(0, 0, 0)
+
+	if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+		desired += cameraCFrame.LookVector
+	end
+
+	if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+		desired -= cameraCFrame.LookVector
+	end
+
+	if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+		desired -= cameraCFrame.RightVector
+	end
+
+	if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+		desired += cameraCFrame.RightVector
+	end
+
+	-- Project onto XZ plane so forward movement doesn’t accidentally push into the ground/air.
+	desired = Vector3.new(desired.X, 0, desired.Z)
+
+	if desired.Magnitude > 1 then
+		desired = desired.Unit
+	end
+
+	-- Use Humanoid:Move rather than setting WalkToPoint:
+	-- - Move is instantaneous per-frame intent and works in the air for air control.
+	humanoid:Move(desired, false)
+end
+
+--[[
+	bindInputs()
+
+	Why:
+	- Use UserInputService directly for simple, low-latency binds. ContextActionService is great
+	  for rebinding and mobile support, but overkill for this minimal desktop-focused demo.
+
+	Keys:
+	- LeftShift: hold to sprint.
+	- LeftControl: tap to slide (guarded by grounded check and cooldown).
+	- Space is left to engine jump to preserve consistent jump buffering and ladder behavior.
+]]
+local function bindInputs()
+	UserInputService.InputBegan:Connect(function(inputObject, gameProcessed)
+		if gameProcessed then
+			return
+		end
+
+		if inputObject.KeyCode == Enum.KeyCode.LeftShift then
+			setSprint(true)
+			return
+		end
+
+		if inputObject.KeyCode == Enum.KeyCode.LeftControl then
+			if grounded() then
+				startSlide()
+			end
+			return
+		end
+	end)
+
+	UserInputService.InputEnded:Connect(function(inputObject)
+		if inputObject.KeyCode == Enum.KeyCode.LeftShift then
+			setSprint(false)
+		end
+	end)
+end
+
+--[[
+	initCharacter()
+
+	Why:
+	- Characters respawn, so all references (Humanoid, RootPart) must be reacquired.
+	- Camera must be re-locked each spawn, otherwise Roblox might restore previous player
+	  camera settings (especially when testing in Studio).
+
+	Camera policy detail:
+	- We keep CameraType = Custom and set CameraMode = LockFirstPerson.
+	  This uses engine camera for head tracking (robust), and we only adjust FieldOfView
+	  and Humanoid.CameraOffset. We avoid manual camera CFrame control to reduce conflicts.
+]]
+local function initCharacter(model)
+	character = model
+	humanoid = character:WaitForChild("Humanoid")
+	humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+
+	-- First-person lock: min and max zoom tiny and CameraMode locked.
+	localPlayer.CameraMinZoomDistance = 0.5
+	localPlayer.CameraMaxZoomDistance = 0.5
+	localPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
+
+	-- Engine camera handles head tracking; we only tweak FOV for “speed feel”.
+	local cam = workspace.CurrentCamera
+	cam.CameraType = Enum.CameraType.Custom
+	cam.FieldOfView = BASE_FOV
+	currentTargetFov = BASE_FOV
+
+	-- Movement baselines.
+	humanoid.WalkSpeed = WALK_SPEED
+	humanoid.JumpPower = JUMP_POWER
+
+	-- Reset state flags so respawn doesn’t carry stale slide/sprint.
+	isSprinting = false
+	isSliding = false
+	lastSlideEndedAt = 0
+	headBobT = 0
+	headBobAmount = 0
+end
+
+--[[
+	mainLoop()
+
+	Why:
+	- Central place to update FOV lerp + head bob + movement vector each RenderStepped frame.
+	- RenderStepped syncs with camera, which keeps first-person effects smooth.
+]]
+local function mainLoop()
+	RunService.RenderStepped:Connect(function(dt)
+		-- Smooth FOV toward the target. Direct jumps are visually harsh in FPS.
+		if ENABLE_FOV_KICK then
+			local cam = workspace.CurrentCamera
+			local fov = cam.FieldOfView
+			fov = fov + (currentTargetFov - fov) * 0.12
+			cam.FieldOfView = fov
+		end
+
+		-- Subtle camera motion that follows speed, implemented via CameraOffset.
+		updateHeadBob(dt)
+
+		-- Build and apply camera-relative movement for consistent strafing control.
+		updateMove(dt)
+	end)
+end
+
+--[[
+	Boot:
+
+	We:
+	1) Initialize the current character (works when joining mid-game).
+	2) Bind inputs once (connections persist across spawns; they reference the latest locals).
+	3) Start the per-frame loop (FOV, bob, movement).
+	4) Re-initialize on respawn.
+]]
+do
+	local model = localPlayer.Character or localPlayer.CharacterAdded:Wait()
+	initCharacter(model)
+
+	bindInputs()
+	mainLoop()
+
+	localPlayer.CharacterAdded:Connect(function(newModel)
+		-- Slight defer helps avoid racing against Roblox’s own character setup.
+		task.defer(function()
+			initCharacter(newModel)
+		end)
+	end)
+end
+
+print("SkyPie Movement (First-Person) — ready.")
