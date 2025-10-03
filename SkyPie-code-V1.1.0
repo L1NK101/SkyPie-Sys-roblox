@@ -15,11 +15,6 @@
 	- Clear names (no cryptic hrp/hum unless unavoidable).
 	- Prefer one statement per line; avoid “return on same line” patterns.
 	- Comments favor “why” and trade-offs over “what the line literally does”.
-
-	Networking:
-	- All logic here is client-side, intended for feel. Competitive games usually mirror
-	  movement validation on the server; not included here because you asked for a local
-	  movement module only.
 ]]
 
 -- Services (explicit GetService calls help tooling and avoid globals)
