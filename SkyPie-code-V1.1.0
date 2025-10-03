@@ -1,10 +1,5 @@
 --[[
 	SkyPie – Movement (First-Person Locked)
-
-	Goal:
-	- Deliver a small, readable, professional movement system that follows a strict style guide.
-	- Explain *why* each decision was made, so a reviewer understands intent without guessing.
-
 	Movement included:
 	- Walk (baseline), Sprint (hold), Slide (short impulse + friction), Jump (tuned power).
 
