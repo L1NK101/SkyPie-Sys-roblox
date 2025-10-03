@@ -23,7 +23,7 @@ local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local Debris = game:GetService("Debris")
 
--- Constants (LOUD_SNAKE_CASE as per guide; easy to spot, easy to tweak)
+-- Constants
 -- Speeds are conservative to keep control tight in first-person.
 local WALK_SPEED = 16            -- Chosen to match Roblox default; keeps muscle memory intact.
 local SPRINT_SPEED = 26          -- Higher speed when holding LeftShift; still controllable in FPS.
@@ -33,7 +33,7 @@ local SLIDE_COOLDOWN = 0.85      -- Prevents spamming; balances feel and fairnes
 local JUMP_POWER = 50            -- Slightly higher than default for responsive FPS jumping.
 local GROUND_RAY_LENGTH = 3.5    -- Enough to catch feet contact even on small steps/ramps.
 
--- Camera polish flags (purely aesthetic; can be toggled off if you want zero camera effects)
+-- Camera polish flags (purely aesthetic; can be toggled off)
 local ENABLE_FOV_KICK = true     -- Quick FOV bump on sprint/slide to sell speed in FPS.
 local ENABLE_HEAD_BOB = true     -- Small bob via Humanoid.CameraOffset instead of forcing CFrame.
 
@@ -214,7 +214,7 @@ end
 	updateHeadBob(dt)
 
 	Why:
-	- First-person can feel “stuck to the floor” without micro motion. CameraOffset is the least
+	- First-person can feel stuck to the floor without micro motion. CameraOffset is the least
 	  invasive way to add taste-level bob and avoid fighting the engine camera.
 
 	Shape:
